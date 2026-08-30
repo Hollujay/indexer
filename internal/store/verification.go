@@ -1,0 +1,173 @@
+package store
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+)
+
+// GetContractWasmHash resolves a contract_id to the wasm_hash of the code it
+// currently runs, so a verification submission by contract_id can be filed
+// under the wasm_hash it actually corresponds to.
+func (s *PostgresStore) GetContractWasmHash(ctx context.Context, contractID string) (string, error) {
+	var wasmHash sql.NullString
+	err := s.db.QueryRowContext(ctx,
+		`SELECT wasm_hash FROM contracts WHERE contract_id = $1`, contractID).Scan(&wasmHash)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return wasmHash.String, nil
+}
+
+// ContractCodeExists reports whether the indexer has already observed and
+// stored the given wasm_hash. A verification submission can only be filed
+// against bytecode the indexer has actually seen on-chain.
+func (s *PostgresStore) ContractCodeExists(ctx context.Context, wasmHash string) (bool, error) {
+	var exists bool
+	err := s.db.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM contract_code WHERE wasm_hash = $1)`, wasmHash).Scan(&exists)
+	return exists, err
+}
+
+// CreateVerification records a new verification submission and its source
+// tree in a single transaction. It leaves status as "pending": the build
+// pipeline that reproduces the build and compares hashes is a separate,
+// not-yet-implemented step (see issue #36) that will later transition the
+// record to verified/mismatch/failed via UpdateVerificationResult.
+func (s *PostgresStore) CreateVerification(ctx context.Context, v *ContractVerification, files []VerificationSourceFile) (int64, error) {
+	dbTx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer dbTx.Rollback()
+
+	var id int64
+	err = dbTx.QueryRowContext(ctx, `
+		INSERT INTO contract_verifications (
+			wasm_hash, contract_id, network, repository_url, git_ref, git_commit,
+			rust_version, soroban_sdk_version, build_profile, status)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+		RETURNING id`,
+		v.WasmHash, v.ContractID, v.Network, v.RepositoryURL, v.GitRef, v.GitCommit,
+		v.RustVersion, v.SorobanSDKVersion, v.BuildProfile, VerificationStatusPending,
+	).Scan(&id)
+	if err != nil {
+		return 0, fmt.Errorf("insert contract_verifications: %w", err)
+	}
+
+	for _, f := range files {
+		if _, err := dbTx.ExecContext(ctx, `
+			INSERT INTO contract_verification_sources (wasm_hash, file_path, content, size_bytes)
+			VALUES ($1,$2,$3,$4)
+			ON CONFLICT (wasm_hash, file_path) DO UPDATE SET
+				content = EXCLUDED.content,
+				size_bytes = EXCLUDED.size_bytes`,
+			v.WasmHash, f.FilePath, f.Content, f.SizeBytes,
+		); err != nil {
+			return 0, fmt.Errorf("insert source file %q: %w", f.FilePath, err)
+		}
+	}
+
+	if err := dbTx.Commit(); err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+const verificationSelectCols = `
+	id, wasm_hash, contract_id, network,
+	repository_url, git_ref, git_commit, rust_version, soroban_sdk_version,
+	build_profile::text, status, computed_wasm_hash, failure_reason, build_log,
+	submitted_at, completed_at, updated_at`
+
+func scanVerification(row interface {
+	Scan(dest ...interface{}) error
+}) (*ContractVerification, error) {
+	var v ContractVerification
+	err := row.Scan(
+		&v.ID, &v.WasmHash, &v.ContractID, &v.Network,
+		&v.RepositoryURL, &v.GitRef, &v.GitCommit, &v.RustVersion, &v.SorobanSDKVersion,
+		&v.BuildProfile, &v.Status, &v.ComputedWasmHash, &v.FailureReason, &v.BuildLog,
+		&v.SubmittedAt, &v.CompletedAt, &v.UpdatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &v, nil
+}
+
+// GetLatestVerificationByWasmHash returns the most recent submission for a
+// wasm_hash, or nil if none has been submitted.
+func (s *PostgresStore) GetLatestVerificationByWasmHash(ctx context.Context, wasmHash string) (*ContractVerification, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT `+verificationSelectCols+`
+		FROM contract_verifications
+		WHERE wasm_hash = $1
+		ORDER BY submitted_at DESC
+		LIMIT 1`, wasmHash)
+	v, err := scanVerification(row)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return v, err
+}
+
+// GetVerificationByID returns a single verification submission by its id.
+func (s *PostgresStore) GetVerificationByID(ctx context.Context, id int64) (*ContractVerification, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT `+verificationSelectCols+`
+		FROM contract_verifications
+		WHERE id = $1`, id)
+	v, err := scanVerification(row)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return v, err
+}
+
+// ListVerificationSourceFiles returns the file tree for a wasm_hash's
+// verified source (path and size, without content) so callers can render a
+// source browser's file listing cheaply.
+func (s *PostgresStore) ListVerificationSourceFiles(ctx context.Context, wasmHash string) ([]VerificationSourceFile, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT wasm_hash, file_path, '', size_bytes, created_at
+		FROM contract_verification_sources
+		WHERE wasm_hash = $1
+		ORDER BY file_path`, wasmHash)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []VerificationSourceFile
+	for rows.Next() {
+		var f VerificationSourceFile
+		if err := rows.Scan(&f.WasmHash, &f.FilePath, &f.Content, &f.SizeBytes, &f.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, f)
+	}
+	return out, rows.Err()
+}
+
+// GetVerificationSourceFile returns one file's content from a wasm_hash's
+// verified source tree, or nil if the wasm_hash has no verified source or
+// the path was not part of the submission.
+func (s *PostgresStore) GetVerificationSourceFile(ctx context.Context, wasmHash, path string) (*VerificationSourceFile, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT wasm_hash, file_path, content, size_bytes, created_at
+		FROM contract_verification_sources
+		WHERE wasm_hash = $1 AND file_path = $2`, wasmHash, path)
+	var f VerificationSourceFile
+	err := row.Scan(&f.WasmHash, &f.FilePath, &f.Content, &f.SizeBytes, &f.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &f, nil
+}
