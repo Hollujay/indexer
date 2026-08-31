@@ -242,11 +242,13 @@ type ContractVerification struct {
 }
 
 // VerificationSourceFile represents a row in the contract_verification_sources
-// table: one file of a verified source tree, keyed by wasm_hash + file_path.
+// table: one file of a verified source tree, keyed by verification_id +
+// file_path so each submission's snapshot is independently retrievable.
 type VerificationSourceFile struct {
-	WasmHash  string    `db:"wasm_hash"`
-	FilePath  string    `db:"file_path"`
-	Content   string    `db:"content"`
-	SizeBytes int32     `db:"size_bytes"`
-	CreatedAt time.Time `db:"created_at"`
+	VerificationID int64     `db:"verification_id"`
+	WasmHash       string    `db:"wasm_hash"`
+	FilePath       string    `db:"file_path"`
+	Content        string    `db:"content"`
+	SizeBytes      int32     `db:"size_bytes"`
+	CreatedAt      time.Time `db:"created_at"`
 }

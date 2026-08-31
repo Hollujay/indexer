@@ -60,12 +60,9 @@ func (s *PostgresStore) CreateVerification(ctx context.Context, v *ContractVerif
 
 	for _, f := range files {
 		if _, err := dbTx.ExecContext(ctx, `
-			INSERT INTO contract_verification_sources (wasm_hash, file_path, content, size_bytes)
-			VALUES ($1,$2,$3,$4)
-			ON CONFLICT (wasm_hash, file_path) DO UPDATE SET
-				content = EXCLUDED.content,
-				size_bytes = EXCLUDED.size_bytes`,
-			v.WasmHash, f.FilePath, f.Content, f.SizeBytes,
+			INSERT INTO contract_verification_sources (verification_id, wasm_hash, file_path, content, size_bytes)
+			VALUES ($1,$2,$3,$4,$5)`,
+			id, v.WasmHash, f.FilePath, f.Content, f.SizeBytes,
 		); err != nil {
 			return 0, fmt.Errorf("insert source file %q: %w", f.FilePath, err)
 		}
@@ -128,15 +125,23 @@ func (s *PostgresStore) GetVerificationByID(ctx context.Context, id int64) (*Con
 	return v, err
 }
 
-// ListVerificationSourceFiles returns the file tree for a wasm_hash's
-// verified source (path and size, without content) so callers can render a
-// source browser's file listing cheaply.
+// ListVerificationSourceFiles returns the file tree (path and size, without
+// content) belonging to the most recent submission for a wasm_hash, so
+// callers can render a source browser's file listing cheaply. Scoping to the
+// latest submission's verification_id (rather than wasm_hash alone) ensures
+// an older, already-completed verification's file snapshot is never mixed
+// with a newer resubmission's files.
 func (s *PostgresStore) ListVerificationSourceFiles(ctx context.Context, wasmHash string) ([]VerificationSourceFile, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT wasm_hash, file_path, '', size_bytes, created_at
-		FROM contract_verification_sources
-		WHERE wasm_hash = $1
-		ORDER BY file_path`, wasmHash)
+		SELECT cvs.verification_id, cvs.wasm_hash, cvs.file_path, '', cvs.size_bytes, cvs.created_at
+		FROM contract_verification_sources cvs
+		WHERE cvs.verification_id = (
+			SELECT id FROM contract_verifications
+			WHERE wasm_hash = $1
+			ORDER BY submitted_at DESC
+			LIMIT 1
+		)
+		ORDER BY cvs.file_path`, wasmHash)
 	if err != nil {
 		return nil, err
 	}
@@ -145,7 +150,7 @@ func (s *PostgresStore) ListVerificationSourceFiles(ctx context.Context, wasmHas
 	var out []VerificationSourceFile
 	for rows.Next() {
 		var f VerificationSourceFile
-		if err := rows.Scan(&f.WasmHash, &f.FilePath, &f.Content, &f.SizeBytes, &f.CreatedAt); err != nil {
+		if err := rows.Scan(&f.VerificationID, &f.WasmHash, &f.FilePath, &f.Content, &f.SizeBytes, &f.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, f)
@@ -153,16 +158,24 @@ func (s *PostgresStore) ListVerificationSourceFiles(ctx context.Context, wasmHas
 	return out, rows.Err()
 }
 
-// GetVerificationSourceFile returns one file's content from a wasm_hash's
-// verified source tree, or nil if the wasm_hash has no verified source or
-// the path was not part of the submission.
+// GetVerificationSourceFile returns one file's content from the most recent
+// submission's verified source tree for a wasm_hash, or nil if there is no
+// verification for the wasm_hash or the path was not part of that
+// submission. See ListVerificationSourceFiles for why this is scoped to the
+// latest verification_id rather than wasm_hash alone.
 func (s *PostgresStore) GetVerificationSourceFile(ctx context.Context, wasmHash, path string) (*VerificationSourceFile, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT wasm_hash, file_path, content, size_bytes, created_at
-		FROM contract_verification_sources
-		WHERE wasm_hash = $1 AND file_path = $2`, wasmHash, path)
+		SELECT cvs.verification_id, cvs.wasm_hash, cvs.file_path, cvs.content, cvs.size_bytes, cvs.created_at
+		FROM contract_verification_sources cvs
+		WHERE cvs.file_path = $2
+		AND cvs.verification_id = (
+			SELECT id FROM contract_verifications
+			WHERE wasm_hash = $1
+			ORDER BY submitted_at DESC
+			LIMIT 1
+		)`, wasmHash, path)
 	var f VerificationSourceFile
-	err := row.Scan(&f.WasmHash, &f.FilePath, &f.Content, &f.SizeBytes, &f.CreatedAt)
+	err := row.Scan(&f.VerificationID, &f.WasmHash, &f.FilePath, &f.Content, &f.SizeBytes, &f.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -170,4 +183,29 @@ func (s *PostgresStore) GetVerificationSourceFile(ctx context.Context, wasmHash,
 		return nil, err
 	}
 	return &f, nil
+}
+
+// GetVerificationSourceFilesByVerificationID returns the exact file snapshot
+// that produced a specific verification record's result, independent of
+// whatever the wasm_hash's latest submission happens to be.
+func (s *PostgresStore) GetVerificationSourceFilesByVerificationID(ctx context.Context, verificationID int64) ([]VerificationSourceFile, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT verification_id, wasm_hash, file_path, content, size_bytes, created_at
+		FROM contract_verification_sources
+		WHERE verification_id = $1
+		ORDER BY file_path`, verificationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []VerificationSourceFile
+	for rows.Next() {
+		var f VerificationSourceFile
+		if err := rows.Scan(&f.VerificationID, &f.WasmHash, &f.FilePath, &f.Content, &f.SizeBytes, &f.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, f)
+	}
+	return out, rows.Err()
 }

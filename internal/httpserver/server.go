@@ -97,7 +97,7 @@ func New(addr string, opts Options) *Server {
 	mux.HandleFunc("GET /v1/domains/{name}", s.handleDomainByName)
 	mux.HandleFunc("GET /v1/domains", s.handleDomains)
 
-	mux.HandleFunc("POST /v1/verify", s.handleVerifySubmit)
+	mux.HandleFunc("POST /v1/verify", rateLimitMiddleware(newIPRateLimiter(verifyRateLimitPerMinute, verifyRateLimitWindow), s.handleVerifySubmit))
 	mux.HandleFunc("GET /v1/verify/contract/{contractId}", s.handleVerifyByContract)
 	mux.HandleFunc("GET /v1/verify/wasm/{wasmHash}/source/{path...}", s.handleVerifySourceFile)
 	mux.HandleFunc("GET /v1/verify/wasm/{wasmHash}/source", s.handleVerifySourceTree)

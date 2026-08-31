@@ -41,14 +41,23 @@ CREATE INDEX idx_contract_verifications_contract_id ON contract_verifications (c
 -- text (submitted source is source code, not arbitrary binary); size_bytes
 -- is persisted alongside so the tree listing can show file sizes without
 -- reading content back out.
+--
+-- Keyed by verification_id (not just wasm_hash) so each submission's file
+-- snapshot is independently retrievable: a second submission against the
+-- same wasm_hash (e.g. a correction after a mismatch) creates a new
+-- contract_verifications row and its own set of source rows, rather than
+-- overwriting the files belonging to an earlier, already-completed
+-- verification record.
 CREATE TABLE contract_verification_sources (
-    id           BIGSERIAL PRIMARY KEY,
-    wasm_hash    CHAR(64) NOT NULL REFERENCES contract_code(wasm_hash),
-    file_path    VARCHAR(1024) NOT NULL,
-    content      TEXT NOT NULL,
-    size_bytes   INTEGER NOT NULL,
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (wasm_hash, file_path)
+    id              BIGSERIAL PRIMARY KEY,
+    verification_id BIGINT NOT NULL REFERENCES contract_verifications(id),
+    wasm_hash       CHAR(64) NOT NULL REFERENCES contract_code(wasm_hash),
+    file_path       VARCHAR(1024) NOT NULL,
+    content         TEXT NOT NULL,
+    size_bytes      INTEGER NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (verification_id, file_path)
 );
 
 CREATE INDEX idx_contract_verification_sources_wasm_hash ON contract_verification_sources (wasm_hash);
+CREATE INDEX idx_contract_verification_sources_verification_id ON contract_verification_sources (verification_id);
