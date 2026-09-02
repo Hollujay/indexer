@@ -10,8 +10,8 @@ func TestVerificationLifecycle(t *testing.T) {
 	defer db.Close()
 	ctx := context.Background()
 
-	wasmHash := "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc0"
-	contractID := "CTESTCONTRACTVERIFICATIONXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+	wasmHash := "ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc0"
+	contractID := "CTESTCONTRACTVERIFICATIONXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
 
 	defer func() {
 		_, _ = db.db.ExecContext(ctx, "DELETE FROM contract_verification_sources WHERE wasm_hash = $1", wasmHash)
