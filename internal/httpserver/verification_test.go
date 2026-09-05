@@ -206,12 +206,36 @@ func TestSanitizeSourcePath(t *testing.T) {
 		{"a/../../b", false},
 		{"", false},
 		{".", false},
+		{"C:/foo.rs", false},
+		{"c:foo.rs", false},
+		{`C:\foo.rs`, false},
 	}
 	for _, c := range cases {
 		_, ok := sanitizeSourcePath(c.in)
 		if ok != c.valid {
 			t.Errorf("sanitizeSourcePath(%q) valid = %v, want %v", c.in, ok, c.valid)
 		}
+	}
+}
+
+func TestVerifySubmit_RejectsOversizedField(t *testing.T) {
+	fv := &fakeVerification{
+		wasmHashByContract: map[string]string{"CCONTRACT": strings.Repeat("a", 64)},
+		codeExists:         map[string]bool{strings.Repeat("a", 64): true},
+	}
+	srv := newTestServerWithVerification(fv)
+
+	body := fmt.Sprintf(`{"contractId":"CCONTRACT","network":%q,"files":{"src/lib.rs":"fn main(){}"}}`,
+		strings.Repeat("x", maxNetworkLen+1))
+	req := httptest.NewRequest(http.MethodPost, "/v1/verify", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	srv.srv.Handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body=%s", rec.Code, rec.Body.String())
+	}
+	if len(fv.created) != 0 {
+		t.Fatalf("expected no verification recorded, got %d", len(fv.created))
 	}
 }
 

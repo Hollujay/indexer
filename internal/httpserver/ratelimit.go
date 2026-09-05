@@ -21,10 +21,11 @@ const (
 // human submitting contract source), so a coarse per-minute cap is enough to
 // stop unbounded growth without the complexity of smoothing bursts.
 type ipRateLimiter struct {
-	mu       sync.Mutex
-	limit    int
-	window   time.Duration
-	counters map[string]*windowCounter
+	mu        sync.Mutex
+	limit     int
+	window    time.Duration
+	counters  map[string]*windowCounter
+	lastSweep time.Time
 }
 
 type windowCounter struct {
@@ -47,6 +48,8 @@ func (l *ipRateLimiter) allow(key string) bool {
 	defer l.mu.Unlock()
 
 	now := time.Now()
+	l.sweepExpiredLocked(now)
+
 	c, ok := l.counters[key]
 	if !ok || now.After(c.windowEnds) {
 		c = &windowCounter{count: 0, windowEnds: now.Add(l.window)}
@@ -57,6 +60,21 @@ func (l *ipRateLimiter) allow(key string) bool {
 	}
 	c.count++
 	return true
+}
+
+// sweepExpiredLocked drops entries whose window has already closed, run at
+// most once per window so counters does not grow without bound over the
+// life of a long-running process. Callers must hold l.mu.
+func (l *ipRateLimiter) sweepExpiredLocked(now time.Time) {
+	if now.Sub(l.lastSweep) < l.window {
+		return
+	}
+	l.lastSweep = now
+	for key, c := range l.counters {
+		if now.After(c.windowEnds) {
+			delete(l.counters, key)
+		}
+	}
 }
 
 // clientIP extracts the request's source IP for rate-limiting purposes,

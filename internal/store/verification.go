@@ -96,14 +96,23 @@ func scanVerification(row interface {
 	return &v, nil
 }
 
-// GetLatestVerificationByWasmHash returns the most recent submission for a
-// wasm_hash, or nil if none has been submitted.
+// latestVerificationOrder ranks a verified submission ahead of every other
+// status regardless of recency, falling back to submission recency within
+// that. POST /v1/verify has no auth and no check that the submitter is the
+// contract's deployer, so without this a garbage resubmission against an
+// already-verified wasm_hash would otherwise become "latest" and bury the
+// verified record behind it.
+const latestVerificationOrder = `ORDER BY (status = 'verified') DESC, submitted_at DESC`
+
+// GetLatestVerificationByWasmHash returns the verified submission for a
+// wasm_hash if one exists, otherwise the most recent submission of any
+// status, or nil if none has been submitted. See latestVerificationOrder.
 func (s *PostgresStore) GetLatestVerificationByWasmHash(ctx context.Context, wasmHash string) (*ContractVerification, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT `+verificationSelectCols+`
 		FROM contract_verifications
 		WHERE wasm_hash = $1
-		ORDER BY submitted_at DESC
+		`+latestVerificationOrder+`
 		LIMIT 1`, wasmHash)
 	v, err := scanVerification(row)
 	if err == sql.ErrNoRows {
@@ -126,11 +135,11 @@ func (s *PostgresStore) GetVerificationByID(ctx context.Context, id int64) (*Con
 }
 
 // ListVerificationSourceFiles returns the file tree (path and size, without
-// content) belonging to the most recent submission for a wasm_hash, so
-// callers can render a source browser's file listing cheaply. Scoping to the
-// latest submission's verification_id (rather than wasm_hash alone) ensures
-// an older, already-completed verification's file snapshot is never mixed
-// with a newer resubmission's files.
+// content) belonging to the wasm_hash's latest submission (see
+// latestVerificationOrder), so callers can render a source browser's file
+// listing cheaply. Scoping to that submission's verification_id (rather than
+// wasm_hash alone) ensures an older, already-completed verification's file
+// snapshot is never mixed with a different submission's files.
 func (s *PostgresStore) ListVerificationSourceFiles(ctx context.Context, wasmHash string) ([]VerificationSourceFile, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT cvs.verification_id, cvs.wasm_hash, cvs.file_path, '', cvs.size_bytes, cvs.created_at
@@ -138,7 +147,7 @@ func (s *PostgresStore) ListVerificationSourceFiles(ctx context.Context, wasmHas
 		WHERE cvs.verification_id = (
 			SELECT id FROM contract_verifications
 			WHERE wasm_hash = $1
-			ORDER BY submitted_at DESC
+			`+latestVerificationOrder+`
 			LIMIT 1
 		)
 		ORDER BY cvs.file_path`, wasmHash)
@@ -158,8 +167,8 @@ func (s *PostgresStore) ListVerificationSourceFiles(ctx context.Context, wasmHas
 	return out, rows.Err()
 }
 
-// GetVerificationSourceFile returns one file's content from the most recent
-// submission's verified source tree for a wasm_hash, or nil if there is no
+// GetVerificationSourceFile returns one file's content from the wasm_hash's
+// latest submission (see latestVerificationOrder), or nil if there is no
 // verification for the wasm_hash or the path was not part of that
 // submission. See ListVerificationSourceFiles for why this is scoped to the
 // latest verification_id rather than wasm_hash alone.
@@ -171,7 +180,7 @@ func (s *PostgresStore) GetVerificationSourceFile(ctx context.Context, wasmHash,
 		AND cvs.verification_id = (
 			SELECT id FROM contract_verifications
 			WHERE wasm_hash = $1
-			ORDER BY submitted_at DESC
+			`+latestVerificationOrder+`
 			LIMIT 1
 		)`, wasmHash, path)
 	var f VerificationSourceFile

@@ -85,4 +85,30 @@ func TestVerificationLifecycle(t *testing.T) {
 	if f == nil || f.Content != "fn main() {}" {
 		t.Fatalf("unexpected source file content: %+v", f)
 	}
+
+	if _, err := db.db.ExecContext(ctx,
+		"UPDATE contract_verifications SET status = $1 WHERE id = $2", VerificationStatusVerified, id); err != nil {
+		t.Fatalf("failed to mark verification verified: %v", err)
+	}
+
+	spamID, err := db.CreateVerification(ctx, v, []VerificationSourceFile{
+		{FilePath: "src/lib.rs", Content: "fn spam() {}", SizeBytes: 12},
+	})
+	if err != nil {
+		t.Fatalf("CreateVerification (spam resubmission) failed: %v", err)
+	}
+	if spamID == id {
+		t.Fatal("expected a distinct id for the resubmission")
+	}
+
+	got, err = db.GetLatestVerificationByWasmHash(ctx, wasmHash)
+	if err != nil {
+		t.Fatalf("GetLatestVerificationByWasmHash failed: %v", err)
+	}
+	if got == nil || got.ID != id {
+		t.Fatalf("expected the verified record (id=%d) to stay latest despite a newer pending resubmission, got %+v", id, got)
+	}
+	if got.Status != VerificationStatusVerified {
+		t.Errorf("status = %q, want verified", got.Status)
+	}
 }

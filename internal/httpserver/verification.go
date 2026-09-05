@@ -22,6 +22,21 @@ const (
 	maxVerificationTotalBytes = 10 << 20 // 10 MiB per submission
 )
 
+// Metadata field length limits, matching the column widths in
+// migrations/000016_create_contract_verifications.up.sql. Checking these
+// before INSERT lets an oversized field fail as a 400 instead of surfacing
+// as a generic 500 from a truncated Postgres write.
+const (
+	maxContractIDLen        = 56
+	maxNetworkLen           = 16
+	maxRepositoryURLLen     = 1024
+	maxGitRefLen            = 256
+	maxGitCommitLen         = 64
+	maxRustVersionLen       = 64
+	maxSorobanSDKVersionLen = 64
+	maxSourceFilePathLen    = 1024
+)
+
 // VerificationStore is the store subset the verification API needs.
 type VerificationStore interface {
 	GetContractWasmHash(ctx context.Context, contractID string) (string, error)
@@ -145,6 +160,10 @@ func (s *Server) handleVerifySubmit(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Network == "" {
 		writeJSONError(w, http.StatusBadRequest, "network is required")
+		return
+	}
+	if errMsg := validateSubmissionFieldLengths(req); errMsg != "" {
+		writeJSONError(w, http.StatusBadRequest, errMsg)
 		return
 	}
 
@@ -358,15 +377,19 @@ func normalizeSubmittedFiles(files map[string]string) ([]store.VerificationSourc
 	return out, ""
 }
 
-// sanitizeSourcePath rejects absolute paths, empty paths, and any path that
-// escapes its own tree (".." segments), which is the same class of
-// traversal a submitted archive could otherwise use to write outside its
-// scratch directory.
+// sanitizeSourcePath rejects absolute paths, empty paths, Windows-drive-style
+// paths (`C:/foo`), and any path that escapes its own tree (".." segments),
+// which is the same class of traversal a submitted archive could otherwise
+// use to write outside its scratch directory once the build pipeline starts
+// extracting these paths to disk.
 func sanitizeSourcePath(p string) (string, bool) {
-	if p == "" || strings.ContainsRune(p, 0) {
+	if p == "" || len(p) > maxSourceFilePathLen || strings.ContainsRune(p, 0) {
 		return "", false
 	}
 	if strings.HasPrefix(p, "/") || strings.HasPrefix(p, "\\") {
+		return "", false
+	}
+	if hasWindowsDrivePrefix(p) {
 		return "", false
 	}
 	cleaned := path.Clean(strings.ReplaceAll(p, "\\", "/"))
@@ -374,6 +397,41 @@ func sanitizeSourcePath(p string) (string, bool) {
 		return "", false
 	}
 	return cleaned, true
+}
+
+// hasWindowsDrivePrefix reports whether p starts with a drive letter
+// (`C:`), which path.Clean does not treat as absolute since it only knows
+// POSIX-style paths.
+func hasWindowsDrivePrefix(p string) bool {
+	if len(p) < 2 || p[1] != ':' {
+		return false
+	}
+	c := p[0]
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+// validateSubmissionFieldLengths checks metadata fields against the column
+// widths they will be inserted into, so an oversized field is rejected here
+// with a 400 rather than failing INSERT with a generic 500.
+func validateSubmissionFieldLengths(req verifySubmission) string {
+	switch {
+	case len(req.ContractID) > maxContractIDLen:
+		return fmt.Sprintf("contractId exceeds max length of %d", maxContractIDLen)
+	case len(req.Network) > maxNetworkLen:
+		return fmt.Sprintf("network exceeds max length of %d", maxNetworkLen)
+	case len(req.RepositoryURL) > maxRepositoryURLLen:
+		return fmt.Sprintf("repositoryUrl exceeds max length of %d", maxRepositoryURLLen)
+	case len(req.GitRef) > maxGitRefLen:
+		return fmt.Sprintf("gitRef exceeds max length of %d", maxGitRefLen)
+	case len(req.GitCommit) > maxGitCommitLen:
+		return fmt.Sprintf("gitCommit exceeds max length of %d", maxGitCommitLen)
+	case len(req.RustVersion) > maxRustVersionLen:
+		return fmt.Sprintf("rustVersion exceeds max length of %d", maxRustVersionLen)
+	case len(req.SorobanSDKVersion) > maxSorobanSDKVersionLen:
+		return fmt.Sprintf("sorobanSdkVersion exceeds max length of %d", maxSorobanSDKVersionLen)
+	default:
+		return ""
+	}
 }
 
 func writeJSONError(w http.ResponseWriter, status int, msg string) {
